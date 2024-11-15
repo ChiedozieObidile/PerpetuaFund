@@ -1,4 +1,4 @@
-;; PerpetuaFund: A Yield-Bearing Charity Fund with Customizable Inheritance Tiers
+;; PerpetuaFund: A Yield-Bearing Charity Fund with Customizable Inheritance Tiers and Time-Locked Notifications
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -9,6 +9,8 @@
 (define-constant err-transfer-failed (err u104))
 (define-constant err-invalid-tier (err u105))
 (define-constant err-beneficiary-not-found (err u106))
+(define-constant err-not-beneficiary (err u107))
+(define-constant err-not-unlocked (err u108))
 
 ;; Data Variables
 (define-data-var total-pool-balance uint u0)
@@ -19,7 +21,11 @@
 (define-map votes {charity: (string-ascii 64), voter: principal} bool)
 (define-map inheritance-tiers 
   {owner: principal, tier: uint} 
-  {inactivity-period: uint, beneficiary: principal, percentage: uint}
+  {inactivity-period: uint, beneficiary: principal, percentage: uint, last-notification: uint}
+)
+(define-map beneficiary-notifications 
+  {beneficiary: principal, owner: principal} 
+  {tier: uint, unlock-time: uint, notified: bool}
 )
 
 ;; Private Functions
@@ -108,7 +114,7 @@
     (asserts! (and (>= tier u1) (<= tier u3)) err-invalid-tier)
     (asserts! (<= percentage u100) err-invalid-tier)
     (map-set inheritance-tiers {owner: tx-sender, tier: tier} 
-      {inactivity-period: inactivity-period, beneficiary: beneficiary, percentage: percentage})
+      {inactivity-period: inactivity-period, beneficiary: beneficiary, percentage: percentage, last-notification: u0})
     (update-activity)
     (ok true)
   )
@@ -141,9 +147,78 @@
         (map-delete inheritance-tiers {owner: owner, tier: u1})
         (map-delete inheritance-tiers {owner: owner, tier: u2})
         (map-delete inheritance-tiers {owner: owner, tier: u3})
+        (map-delete beneficiary-notifications {beneficiary: beneficiary, owner: owner})
         (ok amount-to-transfer)
       )
       error (err err-transfer-failed)
+    )
+  )
+)
+
+;; Time-Locked Notifications for Beneficiaries
+(define-public (check-and-notify-beneficiaries)
+  (let (
+    (current-time block-height)
+    (last-activity (var-get last-activity-time))
+  )
+    (map-set beneficiary-notifications 
+      {beneficiary: tx-sender, owner: contract-owner}
+      (merge 
+        (default-to 
+          {tier: u0, unlock-time: u0, notified: false}
+          (map-get? beneficiary-notifications {beneficiary: tx-sender, owner: contract-owner})
+        )
+        {
+          tier: (get-highest-eligible-tier tx-sender contract-owner current-time last-activity),
+          unlock-time: (+ last-activity (get-inactivity-period tx-sender contract-owner)),
+          notified: true
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-private (get-highest-eligible-tier (beneficiary principal) (owner principal) (current-time uint) (last-activity uint))
+  (let (
+    (tier-1 (default-to {inactivity-period: u0, beneficiary: 'SP000000000000000000002Q6VF78, percentage: u0, last-notification: u0} 
+              (map-get? inheritance-tiers {owner: owner, tier: u1})))
+    (tier-2 (default-to {inactivity-period: u0, beneficiary: 'SP000000000000000000002Q6VF78, percentage: u0, last-notification: u0} 
+              (map-get? inheritance-tiers {owner: owner, tier: u2})))
+    (tier-3 (default-to {inactivity-period: u0, beneficiary: 'SP000000000000000000002Q6VF78, percentage: u0, last-notification: u0} 
+              (map-get? inheritance-tiers {owner: owner, tier: u3})))
+  )
+    (if (and (is-eq beneficiary (get beneficiary tier-3)) (>= (- current-time last-activity) (get inactivity-period tier-3)))
+      u3
+      (if (and (is-eq beneficiary (get beneficiary tier-2)) (>= (- current-time last-activity) (get inactivity-period tier-2)))
+        u2
+        (if (and (is-eq beneficiary (get beneficiary tier-1)) (>= (- current-time last-activity) (get inactivity-period tier-1)))
+          u1
+          u0
+        )
+      )
+    )
+  )
+)
+
+(define-private (get-inactivity-period (beneficiary principal) (owner principal))
+  (let (
+    (tier-1 (default-to {inactivity-period: u0, beneficiary: 'SP000000000000000000002Q6VF78, percentage: u0, last-notification: u0} 
+              (map-get? inheritance-tiers {owner: owner, tier: u1})))
+    (tier-2 (default-to {inactivity-period: u0, beneficiary: 'SP000000000000000000002Q6VF78, percentage: u0, last-notification: u0} 
+              (map-get? inheritance-tiers {owner: owner, tier: u2})))
+    (tier-3 (default-to {inactivity-period: u0, beneficiary: 'SP000000000000000000002Q6VF78, percentage: u0, last-notification: u0} 
+              (map-get? inheritance-tiers {owner: owner, tier: u3})))
+  )
+    (if (is-eq beneficiary (get beneficiary tier-3))
+      (get inactivity-period tier-3)
+      (if (is-eq beneficiary (get beneficiary tier-2))
+        (get inactivity-period tier-2)
+        (if (is-eq beneficiary (get beneficiary tier-1))
+          (get inactivity-period tier-1)
+          u0
+        )
+      )
     )
   )
 )
@@ -167,4 +242,8 @@
 
 (define-read-only (get-last-activity-time)
   (ok (var-get last-activity-time))
+)
+
+(define-read-only (get-beneficiary-notification (beneficiary principal) (owner principal))
+  (ok (unwrap! (map-get? beneficiary-notifications {beneficiary: beneficiary, owner: owner}) err-not-beneficiary))
 )
